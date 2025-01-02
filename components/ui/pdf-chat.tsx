@@ -2,7 +2,7 @@
 
 import { useState, useRef } from 'react';
 import { loadAndProcessPDF } from '@/lib/rag/pdf-processor';
-import { addDocumentsToStore } from '@/lib/rag/vector-store';
+import { initializeVectorStore, addDocumentsToStore, clearVectorStore } from '@/lib/rag/vector-store';
 import { Alert, AlertDescription } from './alert';
 import { PDFUpload, PDFFile } from './pdf-upload';
 import { Button } from './button';
@@ -21,31 +21,69 @@ export default function PDFChat() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<PDFFile | null>(null);
+  const [isPDFMode, setIsPDFMode] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
 
   const handleFileUpload = async (files: PDFFile[]) => {
     const file = files[0];
     if (!file) return;
 
-    setIsLoading(true);
-    setError(null);
-    
     try {
-      // Process the PDF and get text chunks
-      console.log('Processing PDF:', file.name);
-      const chunks = await loadAndProcessPDF(file);
-      console.log('Generated chunks:', chunks.length);
+      setIsLoading(true);
+      setError(null);
       
-      // Add chunks to vector store
-      console.log('Adding chunks to vector store...');
-      await addDocumentsToStore(chunks);
-      
-      setSelectedFile(file);
+      // Clear any existing messages and state
       setMessages([]);
-      console.log('PDF processed successfully');
-    } catch (err: any) {
-      console.error('PDF processing error:', err);
-      setError(err.message || 'Failed to process PDF');
+      setSelectedFile(null);
+      setIsPDFMode(false);
+      
+      console.log('=== PDF PROCESSING START ===');
+      console.log(`Processing PDF: ${file.name} (${Math.round(file.size / 1024)}KB)`);
+      
+      // Step 1: Process PDF into chunks
+      console.log('Processing PDF into chunks...');
+      const chunks = await loadAndProcessPDF(file);
+      console.log(`Generated ${chunks.length} chunks`);
+      
+      if (chunks.length > 0) {
+        console.log('Sample of first chunk:', chunks[0].slice(0, 100));
+      }
+      
+      // Step 2: Send chunks to API for storage
+      console.log('Sending chunks to API...');
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chunks })
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || 'Failed to store chunks');
+      }
+      
+      // Step 3: Update UI state
+      setSelectedFile(file);
+      setIsPDFMode(true);
+      setMessages([{
+        role: 'assistant',
+        content: `I've successfully processed your PDF "${file.name}" and I'm ready to answer questions about it. What would you like to know?`
+      }]);
+      
+      console.log('=== PDF PROCESSING COMPLETE ===');
+    } catch (error: any) {
+      console.error('=== PDF PROCESSING ERROR ===');
+      console.error('Error details:', {
+        message: error.message,
+        stack: error.stack,
+        fileName: file.name,
+        fileSize: file.size
+      });
+      
+      setError(`Failed to process PDF: ${error.message}`);
+      setSelectedFile(null);
+      setIsPDFMode(false);
+      setMessages([]);
     } finally {
       setIsLoading(false);
     }
@@ -67,13 +105,16 @@ export default function PDFChat() {
     }
 
     setIsLoading(true);
+    setError(null);
+    
     try {
       const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message,
-          history: messages.map(({ role, content }) => ({ role, content }))
+          history: messages.map(({ role, content }) => ({ role, content })),
+          isPDFMode
         })
       });
 
@@ -98,63 +139,59 @@ export default function PDFChat() {
 
   return (
     <div className="flex flex-col h-full max-w-3xl mx-auto p-4 space-y-4">
-      <div className="flex-none">
+      <div className="w-full">
         <PDFUpload onUpload={handleFileUpload} />
-        {error && (
-          <Alert variant="destructive" className="mt-4">
-            <AlertCircle className="h-4 w-4" />
-            <AlertDescription>{error}</AlertDescription>
-          </Alert>
+        {selectedFile && (
+          <div className="mt-2 text-sm text-gray-600">
+            Active PDF: {selectedFile.name}
+          </div>
         )}
       </div>
 
-      <Card className="flex-grow overflow-auto p-4">
-        <div className="space-y-4">
-          {messages.map((message, index) => (
-            <div
-              key={index}
-              className={`flex flex-col ${
-                message.role === 'assistant' ? 'items-start' : 'items-end'
-              }`}
-            >
-              <div
-                className={`max-w-[80%] rounded-lg p-4 ${
-                  message.role === 'assistant'
-                    ? 'bg-secondary'
-                    : 'bg-primary text-primary-foreground'
-                }`}
-              >
-                <p className="whitespace-pre-wrap">{message.content}</p>
-                {message.context && message.context.length > 0 && (
-                  <div className="mt-2 text-sm opacity-70">
-                    <p className="font-semibold">Relevant context:</p>
-                    {message.context.map((chunk, i) => (
-                      <p key={i} className="mt-1">{chunk}</p>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      </Card>
+      {error && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
 
-      <form onSubmit={handleSubmit} ref={formRef} className="flex-none">
-        <div className="flex gap-2">
-          <Textarea
-            name="message"
-            placeholder="Ask a question about the PDF..."
-            className="flex-grow"
-            disabled={isLoading || !selectedFile}
-          />
-          <Button type="submit" disabled={isLoading || !selectedFile}>
-            {isLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              'Send'
+      <div className="flex-1 space-y-4 overflow-y-auto">
+        {messages.map((message, index) => (
+          <Card key={index} className="p-4">
+            <div className="font-semibold mb-2">
+              {message.role === 'user' ? 'You' : 'Assistant'}:
+            </div>
+            <div className="whitespace-pre-wrap">{message.content}</div>
+            {message.context && message.context.length > 0 && (
+              <div className="mt-2 text-sm text-gray-600">
+                <div className="font-semibold">Relevant PDF Context:</div>
+                {message.context.map((chunk, i) => (
+                  <div key={i} className="mt-1 p-2 bg-gray-100 rounded">
+                    {chunk}
+                  </div>
+                ))}
+              </div>
             )}
-          </Button>
-        </div>
+          </Card>
+        ))}
+      </div>
+
+      <form onSubmit={handleSubmit} ref={formRef} className="space-y-2">
+        <Textarea
+          name="message"
+          placeholder={isPDFMode ? "Ask a question about the PDF..." : "Send a message..."}
+          className="min-h-[80px]"
+        />
+        <Button type="submit" className="w-full" disabled={isLoading}>
+          {isLoading ? (
+            <>
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              Processing...
+            </>
+          ) : (
+            'Send'
+          )}
+        </Button>
       </form>
     </div>
   );

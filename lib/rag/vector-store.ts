@@ -1,122 +1,142 @@
-import { Document } from "@langchain/core/documents";
+import { OllamaEmbeddings } from "@langchain/community/embeddings/ollama";
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { Document } from "langchain/document";
 import { OllamaService } from "../services/ollama";
 
-interface StoredDocument {
-  pageContent: string;
-  embedding: number[];
-}
-
-class SimpleVectorStore {
-  private documents: StoredDocument[] = [];
-  private ollamaService: OllamaService;
-  private isInitialized: boolean = false;
-
-  constructor() {
-    console.log("Initializing SimpleVectorStore...");
-    this.ollamaService = OllamaService.getInstance();
-  }
-
-  async initialize(): Promise<void> {
-    if (this.isInitialized) {
-      return;
-    }
-
-    try {
-      const status = await this.ollamaService.checkConnection();
-      if (!status.isRunning) {
-        throw new Error(status.error || 'Failed to connect to Ollama service');
-      }
-      this.isInitialized = true;
-      console.log("SimpleVectorStore initialized successfully");
-    } catch (error) {
-      console.error("Failed to initialize SimpleVectorStore:", error);
-      throw error;
-    }
-  }
-
-  async addDocuments(documents: Document[]): Promise<void> {
-    if (!this.isInitialized) {
-      await this.initialize();
-    }
-
-    try {
-      const texts = documents.map(doc => doc.pageContent);
-      console.log(`Getting embeddings for ${texts.length} documents...`);
-      const embeddings = await this.ollamaService.getEmbeddings(texts);
-      console.log(`Generated ${embeddings.length} embeddings`);
-
-      this.documents.push(
-        ...documents.map((doc, i) => ({
-          pageContent: doc.pageContent,
-          embedding: embeddings[i],
-        }))
-      );
-      console.log(`Added ${documents.length} documents to store`);
-    } catch (error) {
-      console.error("Failed to add documents:", error);
-      throw error;
-    }
-  }
-
-  private cosineSimilarity(a: number[], b: number[]): number {
-    const dotProduct = a.reduce((sum, val, i) => sum + val * b[i], 0);
-    const magnitudeA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
-    const magnitudeB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
-    return dotProduct / (magnitudeA * magnitudeB);
-  }
-
-  async similaritySearch(query: string, k: number = 3): Promise<Document[]> {
-    if (!this.isInitialized) {
-      await this.initialize();
-    }
-
-    if (this.documents.length === 0) {
-      return [];
-    }
-
-    try {
-      console.log(`Searching for similar documents to: "${query}"`);
-      const queryEmbedding = (await this.ollamaService.getEmbeddings([query]))[0];
-
-      const similarities = this.documents.map((doc, i) => ({
-        index: i,
-        score: this.cosineSimilarity(queryEmbedding, doc.embedding),
-      }));
-
-      const topK = similarities
-        .sort((a, b) => b.score - a.score)
-        .slice(0, k)
-        .map(({ index }) => new Document({ pageContent: this.documents[index].pageContent }));
-
-      console.log(`Found ${topK.length} similar documents`);
-      return topK;
-    } catch (error) {
-      console.error("Failed to perform similarity search:", error);
-      return [];
-    }
-  }
-}
-
-// Singleton instance
-let vectorStore: SimpleVectorStore | null = null;
+// Global state for vector store
+let vectorStore: MemoryVectorStore | null = null;
+let embeddings: OllamaEmbeddings | null = null;
+let storedDocuments: Document[] = [];
 
 export async function initializeVectorStore() {
-  if (!vectorStore) {
-    console.log("Creating new vector store instance...");
-    vectorStore = new SimpleVectorStore();
-    await vectorStore.initialize();
+  console.log('=== VECTOR STORE INITIALIZATION START ===');
+  
+  try {
+    if (vectorStore && embeddings) {
+      console.log('Vector store already initialized with', storedDocuments.length, 'documents');
+      return vectorStore;
+    }
+    
+    console.log('Connecting to Ollama service...');
+    const ollama = OllamaService.getInstance();
+    const status = await ollama.checkConnection();
+    if (!status.isRunning) {
+      throw new Error(status.error || 'Failed to connect to Ollama');
+    }
+    console.log('Successfully connected to Ollama');
+    
+    const baseUrl = process.env.NEXT_PUBLIC_OLLAMA_API_URL || 'http://127.0.0.1:11434';
+    console.log('Using Ollama base URL:', baseUrl);
+    
+    embeddings = new OllamaEmbeddings({
+      model: "llama3.2",
+      baseUrl: baseUrl
+    });
+    
+    console.log('Creating new vector store instance...');
+    vectorStore = new MemoryVectorStore(embeddings);
+    
+    // If we have stored documents, add them back
+    if (storedDocuments.length > 0) {
+      await vectorStore.addDocuments(storedDocuments);
+      console.log('Restored', storedDocuments.length, 'documents to vector store');
+    }
+    
+    console.log('Vector store initialized successfully');
+    console.log('=== VECTOR STORE INITIALIZATION COMPLETE ===');
+    return vectorStore;
+  } catch (error: any) {
+    console.error('=== VECTOR STORE INITIALIZATION ERROR ===');
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack
+    });
+    throw new Error(`Failed to initialize vector store: ${error.message}`);
   }
-  return vectorStore;
 }
 
-export async function addDocumentsToStore(chunks: string[]) {
-  const store = await initializeVectorStore();
-  const documents = chunks.map(chunk => new Document({ pageContent: chunk }));
-  await store.addDocuments(documents);
+export async function addDocumentsToStore(documents: string[]) {
+  console.log('=== DOCUMENT EMBEDDING START ===');
+  console.log(`Processing ${documents.length} documents for embedding`);
+  
+  try {
+    if (!vectorStore || !embeddings) {
+      await initializeVectorStore();
+    }
+    
+    if (!vectorStore || !embeddings) {
+      throw new Error('Vector store initialization failed');
+    }
+    
+    if (documents.length > 0) {
+      console.log('Sample text for embedding:', documents[0].slice(0, 100));
+    }
+    
+    console.log('Generating embeddings via Ollama...');
+    const docs = documents.map((text, index) => new Document({
+      pageContent: text,
+      metadata: { id: `doc-${storedDocuments.length + index}` }
+    }));
+    
+    await vectorStore.addDocuments(docs);
+    storedDocuments.push(...docs);
+    
+    console.log('Successfully generated embeddings');
+    console.log('Total documents in store:', storedDocuments.length);
+    console.log('=== DOCUMENT EMBEDDING COMPLETE ===');
+  } catch (error: any) {
+    console.error('=== DOCUMENT EMBEDDING ERROR ===');
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack
+    });
+    throw new Error(`Failed to add documents to vector store: ${error.message}`);
+  }
 }
 
-export async function searchSimilarChunks(query: string, k: number = 3) {
-  const store = await initializeVectorStore();
-  const documents = await store.similaritySearch(query, k);
-  return documents.map(doc => doc.pageContent);
+export async function searchSimilarChunks(query: string): Promise<string[]> {
+  console.log('=== SIMILARITY SEARCH START ===');
+  console.log(`Searching for documents similar to query: "${query}"`);
+  
+  try {
+    if (!vectorStore || !embeddings) {
+      console.log('Vector store not initialized, initializing now...');
+      await initializeVectorStore();
+    }
+    
+    if (!vectorStore || !embeddings) {
+      throw new Error('Failed to initialize vector store');
+    }
+    
+    if (storedDocuments.length === 0) {
+      console.log('No documents in store');
+      return [];
+    }
+    
+    console.log('Total documents to search:', storedDocuments.length);
+    console.log('Generating query embedding...');
+    const results = await vectorStore.similaritySearch(query, 3);
+    console.log(`Found ${results.length} similar documents`);
+    
+    if (results.length > 0) {
+      console.log('Sample of first result:', results[0].pageContent.slice(0, 100));
+    }
+    
+    console.log('=== SIMILARITY SEARCH COMPLETE ===');
+    return results.map(doc => doc.pageContent);
+  } catch (error: any) {
+    console.error('=== SIMILARITY SEARCH ERROR ===');
+    console.error('Error details:', {
+      message: error.message,
+      stack: error.stack
+    });
+    throw new Error(`Failed to search similar chunks: ${error.message}`);
+  }
+}
+
+export function clearVectorStore() {
+  vectorStore = null;
+  embeddings = null;
+  storedDocuments = [];
+  console.log('Vector store cleared');
 } 
